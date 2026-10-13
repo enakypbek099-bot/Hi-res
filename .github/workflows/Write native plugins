@@ -1,0 +1,129 @@
+      - name: Write native plugins
+        run: |
+          D=android/app/src/main/java/kz/enakypbek/hires
+          R=android/app/src/main/res
+          mkdir -p $D $R/layout $R/drawable $R/xml
+          
+          # Міне, мына жерге HiResAudioEngine.kt файлын қосасың:
+          cat > $D/HiResAudioEngine.kt << 'EOF'
+          package kz.enakypbek.hires
+
+          import android.media.*
+          import android.os.Handler
+          import android.os.Looper
+          import android.util.Log
+          import java.nio.ByteBuffer
+          import java.nio.ByteOrder
+
+          class HiResAudioEngine(private var audioTrack: AudioTrack) {
+              private val TAG = "HiResAudioEngine"
+              private var isPlaying = false
+              private var audioThread: Thread? = null
+              private val handler = Handler(Looper.getMainLooper())
+
+              fun initializeAudioTrack(sampleRate: Int, channelConfig: Int, encoding: Int, bufferSize: Int) {
+                  try {
+                      val audioFormat = AudioFormat.Builder()
+                          .setEncoding(encoding)
+                          .setSampleRate(sampleRate)
+                          .setChannelMask(channelConfig)
+                          .build()
+
+                      val minBufferSize = AudioTrack.getMinBufferSize(sampleRate, channelConfig, encoding)
+                      val actualBufferSize = maxOf(minBufferSize, bufferSize)
+
+                      audioTrack.release()
+                      audioTrack = AudioTrack.Builder()
+                          .setAudioFormat(audioFormat)
+                          .setBufferSizeInBytes(actualBufferSize)
+                          .setPerformanceMode(AudioTrack.PERFORMANCE_MODE_LOW_LATENCY)
+                          .setTransferMode(AudioTrack.TRANSFER_MODE_STREAMING)
+                          .build()
+
+                      if (android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.Q) {
+                          audioTrack.setOffloadedPlaybackParams(
+                              AudioOffloadInfo.Builder()
+                                  .setSampleRate(sampleRate)
+                                  .setChannelMask(channelConfig)
+                                  .setEncoding(encoding)
+                                  .setFormat(AudioFormat.ENCODING_PCM_32BIT)
+                                  .build()
+                          )
+                          Log.d(TAG, "Offloaded playback configured for bit-perfect audio.")
+                      }
+                  } catch (e: Exception) {
+                      Log.e(TAG, "Error initializing AudioTrack: ${e.message}", e)
+                  }
+              }
+
+              fun play(audioData: ByteArray, sampleRate: Int, channelConfig: Int, encoding: Int) {
+                  if (audioTrack.state != AudioTrack.STATE_INITIALIZED) return
+                  if (!isPlaying) {
+                      try {
+                          audioTrack.play()
+                          isPlaying = true
+                          audioThread = Thread {
+                              try {
+                                  val buffer = ByteBuffer.wrap(audioData)
+                                  buffer.order(ByteOrder.nativeOrder())
+                                  audioTrack.write(audioData, 0, audioData.size, AudioTrack.WRITE_BLOCKING)
+                              } catch (e: Exception) {
+                                  stop()
+                              }
+                          }
+                          audioThread?.start()
+                      } catch (e: Exception) {
+                          isPlaying = false
+                      }
+                  }
+              }
+
+              fun stop() {
+                  if (isPlaying) {
+                      isPlaying = false
+                      audioThread?.interrupt()
+                      try {
+                          audioTrack.stop()
+                          audioTrack.release()
+                      } catch (e: Exception) {}
+                  }
+              }
+
+              fun pause() {
+                  if (isPlaying) {
+                      try {
+                          audioTrack.pause()
+                          isPlaying = false
+                      } catch (e: Exception) {}
+                  }
+              }
+
+              fun resume() {
+                  if (!isPlaying) {
+                      try {
+                          audioTrack.play()
+                          isPlaying = true
+                      } catch (e: Exception) {}
+                  }
+              }
+
+              fun setVolume(volume: Float) {
+                  if (audioTrack.state == AudioTrack.STATE_INITIALIZED) {
+                      val maxVolume = AudioTrack.getMaxVolume()
+                      val vol = volume * maxVolume
+                      try {
+                          audioTrack.setStereoVolume(vol, vol)
+                      } catch (e: Exception) {}
+                  }
+              }
+
+              fun release() {
+                  stop()
+                  try {
+                      audioTrack.release()
+                  } catch (e: Exception) {}
+              }
+          }
+          EOF
+          
+          # (Әрі қарай басқа плагиндер: MainActivity.java, NativeAudioPlugin.java жалғасып кете береді...)
