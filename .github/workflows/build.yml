@@ -1,0 +1,1020 @@
+name: Build APK
+
+on:
+  push:
+    branches: [ main ]
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+
+      - name: Set up JDK 21
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '21'
+
+      - name: Install Capacitor
+        run: npm install
+
+      - name: Prepare web assets
+        run: |
+          mkdir -p www
+          cp index.html manifest.json sw.js icon-192.png icon-512.png icon-maskable-512.png www/
+
+      - name: Create Android project
+        run: npx cap add android
+
+      - name: Add Media3 ExoPlayer dependency
+        run: |
+          python3 - << 'PY'
+          import re
+          p = 'android/app/build.gradle'
+          s = open(p, encoding='utf-8').read()
+          dep = "    implementation 'androidx.media3:media3-exoplayer:1.5.1'\n    implementation 'androidx.media3:media3-common:1.5.1'\n"
+          if 'media3-exoplayer' not in s:
+              s, n = re.subn(r'^dependencies \{\n', 'dependencies {\n' + dep, s, count=1, flags=re.M)
+              if n == 0:
+                  raise SystemExit('dependencies block not found in app/build.gradle')
+          open(p, 'w', encoding='utf-8').write(s)
+          PY
+          grep -n "media3" android/app/build.gradle
+
+      - name: Write native plugins
+        run: |
+          D=android/app/src/main/java/kz/enakypbek/hires
+          R=android/app/src/main/res
+          mkdir -p $D $R/layout $R/drawable
+          cat > $D/MainActivity.java << 'EOF'
+          package kz.enakypbek.hires;
+
+          import android.os.Bundle;
+          import android.webkit.WebView;
+          import com.getcapacitor.BridgeActivity;
+
+          public class MainActivity extends BridgeActivity {
+              @Override
+              public void onCreate(Bundle savedInstanceState) {
+                  registerPlugin(AudioInfoPlugin.class);
+                  registerPlugin(HiResAudioPlugin.class);
+                  registerPlugin(NativeAudioPlugin.class);
+                  super.onCreate(savedInstanceState);
+              }
+
+              private void keepAlive() {
+                  try {
+                      WebView w = getBridge().getWebView();
+                      if (w != null) {
+                          w.onResume();
+                          w.resumeTimers();
+                      }
+                  } catch (Exception e) { }
+              }
+
+              @Override
+              public void onPause() {
+                  super.onPause();
+                  keepAlive();
+              }
+
+              @Override
+              public void onStop() {
+                  super.onStop();
+                  keepAlive();
+              }
+          }
+          EOF
+          cat > $D/AudioInfoPlugin.java << 'EOF'
+          package kz.enakypbek.hires;
+
+          import android.content.Context;
+          import android.media.AudioDeviceInfo;
+          import android.media.AudioManager;
+          import android.os.Build;
+          import com.getcapacitor.JSArray;
+          import com.getcapacitor.JSObject;
+          import com.getcapacitor.Plugin;
+          import com.getcapacitor.PluginCall;
+          import com.getcapacitor.PluginMethod;
+          import com.getcapacitor.annotation.CapacitorPlugin;
+
+          @CapacitorPlugin(name = "AudioInfo")
+          public class AudioInfoPlugin extends Plugin {
+
+              private static String kindOf(int t) {
+                  switch (t) {
+                      case 7: case 8: case 26: case 27: return "bt";
+                      case 3: case 4: case 5: case 6: case 11: case 22: return "wired";
+                      case 1: case 2: return "spk";
+                      default: return "other";
+                  }
+              }
+
+              private static int rank(int t) {
+                  switch (t) {
+                      case 11: case 22: return 5;
+                      case 3: case 4: case 5: case 6: return 4;
+                      case 8: case 26: case 27: return 3;
+                      case 7: return 2;
+                      case 9: return 2;
+                      case 2: return 1;
+                      default: return 0;
+                  }
+              }
+
+              @PluginMethod
+              public void get(PluginCall call) {
+                  JSObject ret = new JSObject();
+                  try {
+                      AudioManager am = (AudioManager) getContext().getSystemService(Context.AUDIO_SERVICE);
+                      if (am != null) {
+                          String sr = am.getProperty(AudioManager.PROPERTY_OUTPUT_SAMPLE_RATE);
+                          String fr = am.getProperty(AudioManager.PROPERTY_OUTPUT_FRAMES_PER_BUFFER);
+                          ret.put("outRate", sr != null ? Integer.parseInt(sr) : 48000);
+                          ret.put("outFrames", fr != null ? Integer.parseInt(fr) : 192);
+                          ret.put("vol", am.getStreamVolume(AudioManager.STREAM_MUSIC));
+                          ret.put("volMax", am.getStreamMaxVolume(AudioManager.STREAM_MUSIC));
+
+                          AudioDeviceInfo best = null;
+                          AudioDeviceInfo[] outs = am.getDevices(AudioManager.GET_DEVICES_OUTPUTS);
+                          for (AudioDeviceInfo d : outs) {
+                              if (best == null || rank(d.getType()) > rank(best.getType())) best = d;
+                          }
+                          if (best != null) {
+                              JSObject dev = new JSObject();
+                              CharSequence nm = best.getProductName();
+                              dev.put("name", nm != null ? nm.toString() : "");
+                              dev.put("type", best.getType());
+                              dev.put("kind", kindOf(best.getType()));
+                              JSArray rates = new JSArray();
+                              for (int x : best.getSampleRates()) rates.put(x);
+                              JSArray enc = new JSArray();
+                              for (int x : best.getEncodings()) enc.put(x);
+                              JSArray ch = new JSArray();
+                              for (int x : best.getChannelCounts()) ch.put(x);
+                              dev.put("rates", rates);
+                              dev.put("enc", enc);
+                              dev.put("ch", ch);
+                              ret.put("dev", dev);
+                          }
+                      }
+                      call.resolve(ret);
+                  } catch (Exception e) {
+                      call.reject("AudioInfo: " + e.getMessage());
+                  }
+              }
+          }
+          EOF
+          cat > $D/NativeAudioPlugin.java << 'EOF'
+          package kz.enakypbek.hires;
+
+          import android.content.Context;
+          import android.media.AudioAttributes;
+          import android.media.AudioDeviceInfo;
+          import android.media.AudioFormat;
+          import android.media.AudioManager;
+          import android.media.AudioMixerAttributes;
+          import android.net.Uri;
+          import android.os.Build;
+          import android.os.Handler;
+          import android.os.Looper;
+          import android.util.Base64;
+
+          import androidx.media3.common.C;
+          import androidx.media3.common.MediaItem;
+          import androidx.media3.common.PlaybackException;
+          import androidx.media3.common.Player;
+          import androidx.media3.exoplayer.DefaultRenderersFactory;
+          import androidx.media3.exoplayer.ExoPlayer;
+
+          import com.getcapacitor.JSArray;
+          import com.getcapacitor.JSObject;
+          import com.getcapacitor.Plugin;
+          import com.getcapacitor.PluginCall;
+          import com.getcapacitor.PluginMethod;
+          import com.getcapacitor.annotation.CapacitorPlugin;
+
+          import java.io.File;
+          import java.io.FileOutputStream;
+          import java.util.ArrayList;
+          import java.util.Arrays;
+          import java.util.Collections;
+          import java.util.Comparator;
+          import java.util.List;
+
+          @CapacitorPlugin(name = "NativeAudio")
+          public class NativeAudioPlugin extends Plugin {
+              private final Handler main = new Handler(Looper.getMainLooper());
+              private ExoPlayer player = null;
+              private boolean playerFloat = false;
+              private FileOutputStream wOut = null;
+              private File wPart = null;
+              private File wFinal = null;
+
+              private void onMain(Runnable r) {
+                  if (Looper.myLooper() == Looper.getMainLooper()) r.run();
+                  else main.post(r);
+              }
+
+              private void emit(String type, String msg, long val) {
+                  try {
+                      JSObject o = new JSObject();
+                      o.put("t", type);
+                      o.put("msg", msg == null ? "" : msg);
+                      o.put("val", val);
+                      notifyListeners("native", o);
+                  } catch (Throwable t) { }
+              }
+
+              private File dir() {
+                  File d = new File(getContext().getCacheDir(), "hires_native");
+                  if (!d.exists()) d.mkdirs();
+                  return d;
+              }
+
+              private File fileFor(String key, String ext) {
+                  String e = ext == null ? "flac" : ext.toLowerCase().replaceAll("[^a-z0-9]", "");
+                  if (e.length() == 0) e = "bin";
+                  return new File(dir(), "t" + Integer.toHexString(key.hashCode()) + "." + e);
+              }
+
+              private void prune(File keep) {
+                  try {
+                      File[] fs = dir().listFiles();
+                      if (fs == null) return;
+                      List<File> l = new ArrayList<File>(Arrays.asList(fs));
+                      Collections.sort(l, new Comparator<File>() {
+                          public int compare(File a, File b) {
+                              return Long.compare(b.lastModified(), a.lastModified());
+                          }
+                      });
+                      int n = 0;
+                      for (File f : l) {
+                          if (keep != null && f.equals(keep)) { n++; continue; }
+                          n++;
+                          if (n > 3) f.delete();
+                      }
+                  } catch (Throwable t) { }
+              }
+
+              @PluginMethod
+              public void beginFile(PluginCall call) {
+                  try {
+                      String key = call.getString("key", "t");
+                      String ext = call.getString("ext", "flac");
+                      long size = call.getData().optLong("size", 0L);
+                      File f = fileFor(key, ext);
+                      JSObject r = new JSObject();
+                      if (f.exists() && f.length() == size && size > 0) {
+                          f.setLastModified(System.currentTimeMillis());
+                          r.put("cached", true);
+                          call.resolve(r);
+                          return;
+                      }
+                      if (wOut != null) { try { wOut.close(); } catch (Throwable t) { } wOut = null; }
+                      wFinal = f;
+                      wPart = new File(f.getAbsolutePath() + ".part");
+                      if (wPart.exists()) wPart.delete();
+                      wOut = new FileOutputStream(wPart);
+                      r.put("cached", false);
+                      call.resolve(r);
+                  } catch (Throwable e) {
+                      call.reject("NativeAudio beginFile: " + e);
+                  }
+              }
+
+              @PluginMethod
+              public void appendChunk(PluginCall call) {
+                  try {
+                      String data = call.getString("data", "");
+                      byte[] b = Base64.decode(data, Base64.DEFAULT);
+                      if (wOut == null) { call.reject("нет открытого файла"); return; }
+                      wOut.write(b);
+                      call.resolve();
+                  } catch (Throwable e) {
+                      call.reject("NativeAudio appendChunk: " + e);
+                  }
+              }
+
+              @PluginMethod
+              public void endFile(PluginCall call) {
+                  try {
+                      if (wOut != null) { wOut.flush(); wOut.close(); wOut = null; }
+                      if (wPart != null && wFinal != null) {
+                          if (wFinal.exists()) wFinal.delete();
+                          if (!wPart.renameTo(wFinal)) { call.reject("не удалось сохранить файл"); return; }
+                          prune(wFinal);
+                      }
+                      call.resolve();
+                  } catch (Throwable e) {
+                      call.reject("NativeAudio endFile: " + e);
+                  }
+              }
+
+              private void ensurePlayer(boolean floatOut) {
+                  if (player != null && playerFloat == floatOut) return;
+                  if (player != null) {
+                      try { player.release(); } catch (Throwable t) { }
+                      player = null;
+                  }
+                  DefaultRenderersFactory rf = new DefaultRenderersFactory(getContext());
+                  rf.setEnableAudioFloatOutput(floatOut);
+                  androidx.media3.common.AudioAttributes aa = new androidx.media3.common.AudioAttributes.Builder()
+                          .setUsage(C.USAGE_MEDIA)
+                          .setContentType(C.AUDIO_CONTENT_TYPE_MUSIC)
+                          .build();
+                  player = new ExoPlayer.Builder(getContext(), rf)
+                          .setAudioAttributes(aa, true)
+                          .setHandleAudioBecomingNoisy(true)
+                          .setWakeMode(C.WAKE_MODE_LOCAL)
+                          .build();
+                  player.addListener(new Player.Listener() {
+                      @Override
+                      public void onPlaybackStateChanged(int state) {
+                          if (state == Player.STATE_ENDED) emit("ended", "", 0);
+                          else if (state == Player.STATE_READY) {
+                              long d = player != null ? player.getDuration() : 0;
+                              emit("ready", "", d == C.TIME_UNSET ? 0 : d);
+                          }
+                      }
+
+                      @Override
+                      public void onIsPlayingChanged(boolean isPlaying) {
+                          emit("playing", isPlaying ? "1" : "0", 0);
+                      }
+
+                      @Override
+                      public void onPlayerError(PlaybackException error) {
+                          emit("error", error.getErrorCodeName() + ": " + error.getMessage(), error.errorCode);
+                      }
+                  });
+                  playerFloat = floatOut;
+              }
+
+              @PluginMethod
+              public void load(final PluginCall call) {
+                  final String key = call.getString("key", "t");
+                  final String ext = call.getString("ext", "flac");
+                  final long startMs = call.getData().optLong("startMs", 0L);
+                  final boolean autoplay = call.getBoolean("autoplay", true);
+                  final int bits = call.getInt("bits", 16);
+                  final int sr = call.getInt("sr", 44100);
+                  final boolean bp = call.getBoolean("bp", false);
+                  final File f = fileFor(key, ext);
+                  if (!f.exists()) { call.reject("файл не найден в кэше"); return; }
+                  f.setLastModified(System.currentTimeMillis());
+                  onMain(new Runnable() {
+                      public void run() {
+                          try {
+                              boolean floatOut = bits > 16;
+                              ensurePlayer(floatOut);
+                              String bpMsg = "";
+                              boolean bpOk = false;
+                              if (bp) {
+                                  if (Build.VERSION.SDK_INT >= 34) {
+                                      String[] r = Bp.apply(getContext(), sr, floatOut);
+                                      bpOk = "1".equals(r[0]);
+                                      bpMsg = r[1];
+                                  } else {
+                                      bpMsg = "Bit-perfect требует Android 14+";
+                                  }
+                              } else if (Build.VERSION.SDK_INT >= 34) {
+                                  Bp.clear(getContext());
+                              }
+                              player.setMediaItem(MediaItem.fromUri(Uri.fromFile(f)), startMs);
+                              player.prepare();
+                              player.setPlayWhenReady(autoplay);
+                              JSObject r = new JSObject();
+                              r.put("bpOk", bpOk);
+                              r.put("bpMsg", bpMsg);
+                              r.put("float", floatOut);
+                              call.resolve(r);
+                          } catch (Throwable e) {
+                              call.reject("NativeAudio load: " + e);
+                          }
+                      }
+                  });
+              }
+
+              @PluginMethod
+              public void play(final PluginCall call) {
+                  onMain(new Runnable() {
+                      public void run() {
+                          try {
+                              if (player != null) {
+                                  if (player.getPlaybackState() == Player.STATE_ENDED) player.seekTo(0);
+                                  player.play();
+                              }
+                              call.resolve();
+                          } catch (Throwable e) { call.reject("NativeAudio play: " + e); }
+                      }
+                  });
+              }
+
+              @PluginMethod
+              public void pause(final PluginCall call) {
+                  onMain(new Runnable() {
+                      public void run() {
+                          try {
+                              if (player != null) player.pause();
+                              call.resolve();
+                          } catch (Throwable e) { call.reject("NativeAudio pause: " + e); }
+                      }
+                  });
+              }
+
+              @PluginMethod
+              public void seek(final PluginCall call) {
+                  final long ms = call.getData().optLong("ms", 0L);
+                  onMain(new Runnable() {
+                      public void run() {
+                          try {
+                              if (player != null) player.seekTo(ms);
+                              call.resolve();
+                          } catch (Throwable e) { call.reject("NativeAudio seek: " + e); }
+                      }
+                  });
+              }
+
+              @PluginMethod
+              public void stop(final PluginCall call) {
+                  onMain(new Runnable() {
+                      public void run() {
+                          try {
+                              if (player != null) { player.stop(); player.clearMediaItems(); }
+                              if (Build.VERSION.SDK_INT >= 34) Bp.clear(getContext());
+                              call.resolve();
+                          } catch (Throwable e) { call.reject("NativeAudio stop: " + e); }
+                      }
+                  });
+              }
+
+              @PluginMethod
+              public void getState(final PluginCall call) {
+                  onMain(new Runnable() {
+                      public void run() {
+                          try {
+                              JSObject o = new JSObject();
+                              if (player != null) {
+                                  long d = player.getDuration();
+                                  o.put("pos", player.getCurrentPosition());
+                                  o.put("dur", d == C.TIME_UNSET ? 0 : d);
+                                  o.put("playing", player.isPlaying());
+                                  o.put("pw", player.getPlayWhenReady());
+                                  o.put("st", player.getPlaybackState());
+                              } else {
+                                  o.put("pos", 0);
+                                  o.put("dur", 0);
+                                  o.put("playing", false);
+                                  o.put("pw", false);
+                                  o.put("st", 1);
+                              }
+                              call.resolve(o);
+                          } catch (Throwable e) { call.reject("NativeAudio getState: " + e); }
+                      }
+                  });
+              }
+
+              @PluginMethod
+              public void probe(PluginCall call) {
+                  JSObject r = new JSObject();
+                  JSArray lines = new JSArray();
+                  try {
+                      lines.put("Android " + Build.VERSION.RELEASE + " (API " + Build.VERSION.SDK_INT + ")");
+                      if (Build.VERSION.SDK_INT >= 34) {
+                          String[] x = Bp.describe(getContext());
+                          for (String s : x) lines.put(s);
+                      } else {
+                          lines.put("Bit-perfect: нужен Android 14+");
+                      }
+                  } catch (Throwable e) {
+                      lines.put("probe ошибка: " + e);
+                  }
+                  r.put("lines", lines);
+                  call.resolve(r);
+              }
+
+              @Override
+              protected void handleOnDestroy() {
+                  try {
+                      if (player != null) { player.release(); player = null; }
+                  } catch (Throwable t) { }
+                  super.handleOnDestroy();
+              }
+
+              /* ---- Android 14+: bit-perfect микшер (минуя системный микшер/ресемплинг) ---- */
+              static class Bp {
+                  static AudioDeviceInfo lastDev = null;
+
+                  static AudioAttributes attrs() {
+                      return new AudioAttributes.Builder()
+                              .setUsage(AudioAttributes.USAGE_MEDIA)
+                              .setContentType(AudioAttributes.CONTENT_TYPE_MUSIC)
+                              .build();
+                  }
+
+                  static int rank(int t) {
+                      switch (t) {
+                          case 11: case 22: case 12: return 5;
+                          case 3: case 4: case 5: case 6: return 4;
+                          case 8: case 26: case 27: return 2;
+                          case 2: return 1;
+                          default: return 0;
+                      }
+                  }
+
+                  static String encName(int e) {
+                      switch (e) {
+                          case AudioFormat.ENCODING_PCM_16BIT: return "16";
+                          case AudioFormat.ENCODING_PCM_FLOAT: return "float";
+                          case AudioFormat.ENCODING_PCM_24BIT_PACKED: return "24";
+                          case AudioFormat.ENCODING_PCM_32BIT: return "32";
+                          case AudioFormat.ENCODING_PCM_8BIT: return "8";
+                          default: return "enc" + e;
+                      }
+                  }
+
+                  static List<AudioDeviceInfo> sorted(AudioManager am) {
+                      List<AudioDeviceInfo> l = new ArrayList<AudioDeviceInfo>(Arrays.asList(am.getDevices(AudioManager.GET_DEVICES_OUTPUTS)));
+                      Collections.sort(l, new Comparator<AudioDeviceInfo>() {
+                          public int compare(AudioDeviceInfo a, AudioDeviceInfo b) {
+                              return rank(b.getType()) - rank(a.getType());
+                          }
+                      });
+                      return l;
+                  }
+
+                  static String[] apply(Context c, int sr, boolean wantFloat) {
+                      try {
+                          AudioManager am = (AudioManager) c.getSystemService(Context.AUDIO_SERVICE);
+                          if (am == null) return new String[]{"0", "AudioManager недоступен"};
+                          clear(c);
+                          int wantEnc = wantFloat ? AudioFormat.ENCODING_PCM_FLOAT : AudioFormat.ENCODING_PCM_16BIT;
+                          String seen = "";
+                          for (AudioDeviceInfo d : sorted(am)) {
+                              List<AudioMixerAttributes> sup = am.getSupportedMixerAttributes(d);
+                              if (sup == null || sup.isEmpty()) continue;
+                              String nm = d.getProductName() == null ? "устройство" : d.getProductName().toString();
+                              AudioMixerAttributes best = null;
+                              for (AudioMixerAttributes a : sup) {
+                                  if (a.getMixerBehavior() != AudioMixerAttributes.MIXER_BEHAVIOR_BIT_PERFECT) continue;
+                                  AudioFormat f = a.getFormat();
+                                  seen += nm + " " + f.getSampleRate() + "/" + encName(f.getEncoding()) + "; ";
+                                  if (f.getSampleRate() == sr && f.getEncoding() == wantEnc) { best = a; break; }
+                              }
+                              if (best != null) {
+                                  boolean ok = am.setPreferredMixerAttributes(attrs(), d, best);
+                                  if (ok) {
+                                      lastDev = d;
+                                      return new String[]{"1", "Bit-perfect: " + nm + " · " + sr + " Hz · PCM " + encName(wantEnc)};
+                                  }
+                                  return new String[]{"0", "Система отклонила bit-perfect для " + nm};
+                              }
+                          }
+                          if (seen.length() == 0) return new String[]{"0", "Нет выхода с bit-perfect (нужен USB-ЦАП, Android 14+)"};
+                          return new String[]{"0", "Формат не совпал: нужно " + sr + " Hz / PCM " + encName(wantEnc) + ". Выход поддерживает: " + seen};
+                      } catch (Throwable e) {
+                          return new String[]{"0", "Bit-perfect ошибка: " + e};
+                      }
+                  }
+
+                  static void clear(Context c) {
+                      try {
+                          if (lastDev == null) return;
+                          AudioManager am = (AudioManager) c.getSystemService(Context.AUDIO_SERVICE);
+                          if (am != null) am.clearPreferredMixerAttributes(attrs(), lastDev);
+                      } catch (Throwable t) { }
+                      lastDev = null;
+                  }
+
+                  static String[] describe(Context c) {
+                      List<String> out = new ArrayList<String>();
+                      try {
+                          AudioManager am = (AudioManager) c.getSystemService(Context.AUDIO_SERVICE);
+                          for (AudioDeviceInfo d : sorted(am)) {
+                              String nm = d.getProductName() == null ? "—" : d.getProductName().toString();
+                              String s = "Выход: " + nm + " (тип " + d.getType() + ")";
+                              List<AudioMixerAttributes> sup = am.getSupportedMixerAttributes(d);
+                              if (sup != null && !sup.isEmpty()) {
+                                  s += " · bit-perfect:";
+                                  for (AudioMixerAttributes a : sup) {
+                                      if (a.getMixerBehavior() != AudioMixerAttributes.MIXER_BEHAVIOR_BIT_PERFECT) continue;
+                                      AudioFormat f = a.getFormat();
+                                      s += " " + f.getSampleRate() + "/" + encName(f.getEncoding());
+                                  }
+                              } else {
+                                  s += " · bit-perfect нет";
+                              }
+                              out.add(s);
+                          }
+                      } catch (Throwable e) {
+                          out.add("describe ошибка: " + e);
+                      }
+                      return out.toArray(new String[0]);
+                  }
+              }
+          }
+          EOF
+          cat > $D/HiResAudioPlugin.java << 'EOF'
+          package kz.enakypbek.hires;
+
+          import android.Manifest;
+          import android.app.Activity;
+          import android.app.Notification;
+          import android.app.NotificationChannel;
+          import android.app.NotificationManager;
+          import android.app.PendingIntent;
+          import android.app.Service;
+          import android.content.BroadcastReceiver;
+          import android.content.Context;
+          import android.content.Intent;
+          import android.content.pm.PackageManager;
+          import android.content.pm.ServiceInfo;
+          import android.graphics.Bitmap;
+          import android.graphics.BitmapFactory;
+          import android.graphics.Canvas;
+          import android.graphics.Paint;
+          import android.graphics.PorterDuff;
+          import android.graphics.PorterDuffXfermode;
+          import android.graphics.RectF;
+          import android.net.Uri;
+          import android.os.Build;
+          import android.os.IBinder;
+          import android.os.PowerManager;
+          import android.provider.Settings;
+          import android.util.Base64;
+          import android.webkit.WebView;
+          import android.widget.RemoteViews;
+          import androidx.core.app.ActivityCompat;
+          import androidx.core.app.NotificationCompat;
+          import androidx.core.content.ContextCompat;
+
+          import com.getcapacitor.Plugin;
+          import com.getcapacitor.PluginCall;
+          import com.getcapacitor.PluginMethod;
+          import com.getcapacitor.annotation.CapacitorPlugin;
+
+          @CapacitorPlugin(name = "HiResAudio")
+          public class HiResAudioPlugin extends Plugin {
+              static final String CHANNEL_ID = "hires_playback_channel";
+              static final String A_PREV = "kz.enakypbek.hires.PREV";
+              static final String A_PLAY = "kz.enakypbek.hires.PLAY";
+              static final String A_NEXT = "kz.enakypbek.hires.NEXT";
+              private static PowerManager.WakeLock wakeLock = null;
+              private static HiResAudioPlugin inst = null;
+              private static Bitmap lastArt = null;
+              private static String lastTitle = "HI-RES";
+              private static String lastArtist = "";
+              private static boolean lastPlaying = true;
+
+              @Override
+              public void load() {
+                  inst = this;
+              }
+
+              static void emit(final String action) {
+                  try {
+                      final HiResAudioPlugin p = inst;
+                      if (p == null || p.getActivity() == null) return;
+                      final String js = "window.dispatchEvent(new CustomEvent('hiresAction',{detail:'" + action + "'}))";
+                      p.getActivity().runOnUiThread(new Runnable() {
+                          public void run() {
+                              try {
+                                  WebView w = p.getBridge().getWebView();
+                                  if (w != null) w.evaluateJavascript(js, null);
+                              } catch (Exception e) { }
+                          }
+                      });
+                  } catch (Exception e) { }
+              }
+
+              @PluginMethod
+              public void startForegroundService(PluginCall call) {
+                  try {
+                      String title = call.getString("title", "HI-RES");
+                      String artist = call.getString("artist", "");
+                      String art = call.getString("art", "");
+                      boolean playing = call.getBoolean("playing", true);
+                      if (Build.VERSION.SDK_INT >= 33 && getActivity() != null
+                              && ContextCompat.checkSelfPermission(getContext(), Manifest.permission.POST_NOTIFICATIONS) != PackageManager.PERMISSION_GRANTED) {
+                          ActivityCompat.requestPermissions(getActivity(), new String[]{Manifest.permission.POST_NOTIFICATIONS}, 77);
+                      }
+                      Intent si = new Intent(getContext(), PlaybackService.class);
+                      si.putExtra("title", title);
+                      si.putExtra("artist", artist);
+                      si.putExtra("art", art);
+                      si.putExtra("playing", playing);
+                      if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+                          getContext().startForegroundService(si);
+                      } else {
+                          getContext().startService(si);
+                      }
+                      PowerManager pm = (PowerManager) getContext().getSystemService(Context.POWER_SERVICE);
+                      if (playing) {
+                          if (wakeLock == null && pm != null) {
+                              wakeLock = pm.newWakeLock(PowerManager.PARTIAL_WAKE_LOCK, "HiRes:WakeLock");
+                              wakeLock.acquire(6 * 60 * 60 * 1000L);
+                          }
+                      } else if (wakeLock != null) {
+                          if (wakeLock.isHeld()) wakeLock.release();
+                          wakeLock = null;
+                      }
+                      call.resolve();
+                  } catch (Exception e) {
+                      call.reject("HiResAudio: " + e.getMessage());
+                  }
+              }
+
+              @PluginMethod
+              public void stopForegroundService(PluginCall call) {
+                  try {
+                      getContext().stopService(new Intent(getContext(), PlaybackService.class));
+                      if (wakeLock != null && wakeLock.isHeld()) wakeLock.release();
+                      wakeLock = null;
+                      call.resolve();
+                  } catch (Exception e) {
+                      call.reject("HiResAudio: " + e.getMessage());
+                  }
+              }
+
+              @PluginMethod
+              public void requestBatteryExemption(PluginCall call) {
+                  try {
+                      PowerManager pm = (PowerManager) getContext().getSystemService(Context.POWER_SERVICE);
+                      String pkg = getContext().getPackageName();
+                      if (Build.VERSION.SDK_INT >= 23 && pm != null && !pm.isIgnoringBatteryOptimizations(pkg)) {
+                          Intent i = new Intent(Settings.ACTION_REQUEST_IGNORE_BATTERY_OPTIMIZATIONS, Uri.parse("package:" + pkg));
+                          i.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK);
+                          getContext().startActivity(i);
+                      }
+                      call.resolve();
+                  } catch (Exception e) {
+                      call.resolve();
+                  }
+              }
+
+              public static class NotifReceiver extends BroadcastReceiver {
+                  @Override
+                  public void onReceive(Context ctx, Intent intent) {
+                      String a = intent.getAction();
+                      if (A_PREV.equals(a)) emit("prev");
+                      else if (A_PLAY.equals(a)) emit("play");
+                      else if (A_NEXT.equals(a)) emit("next");
+                  }
+              }
+
+              static Bitmap roundArt(String b64) {
+                  try {
+                      byte[] d = Base64.decode(b64, Base64.DEFAULT);
+                      Bitmap src = BitmapFactory.decodeByteArray(d, 0, d.length);
+                      if (src == null) return null;
+                      int s = Math.min(src.getWidth(), src.getHeight());
+                      Bitmap out = Bitmap.createBitmap(s, s, Bitmap.Config.ARGB_8888);
+                      Canvas c = new Canvas(out);
+                      Paint p = new Paint(Paint.ANTI_ALIAS_FLAG);
+                      c.drawRoundRect(new RectF(0, 0, s, s), s * 0.18f, s * 0.18f, p);
+                      p.setXfermode(new PorterDuffXfermode(PorterDuff.Mode.SRC_IN));
+                      c.drawBitmap(src, (s - src.getWidth()) / 2f, (s - src.getHeight()) / 2f, p);
+                      return out;
+                  } catch (Throwable t) {
+                      return null;
+                  }
+              }
+
+              public static class PlaybackService extends Service {
+                  @Override
+                  public void onCreate() {
+                      super.onCreate();
+                      if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+                          NotificationChannel ch = new NotificationChannel(CHANNEL_ID, "Hi-Res Playback", NotificationManager.IMPORTANCE_LOW);
+                          ch.setShowBadge(false);
+                          NotificationManager nm = getSystemService(NotificationManager.class);
+                          if (nm != null) nm.createNotificationChannel(ch);
+                      }
+                  }
+
+                  private PendingIntent act(String a, int rc) {
+                      Intent i = new Intent(this, NotifReceiver.class);
+                      i.setAction(a);
+                      return PendingIntent.getBroadcast(this, rc, i, PendingIntent.FLAG_IMMUTABLE | PendingIntent.FLAG_UPDATE_CURRENT);
+                  }
+
+                  @Override
+                  public int onStartCommand(Intent intent, int flags, int startId) {
+                      if (intent != null) {
+                          String t = intent.getStringExtra("title");
+                          String a = intent.getStringExtra("artist");
+                          String art = intent.getStringExtra("art");
+                          if (t != null) lastTitle = t;
+                          if (a != null) lastArtist = a;
+                          lastPlaying = intent.getBooleanExtra("playing", true);
+                          if (art != null && art.length() > 20) {
+                              Bitmap b = roundArt(art);
+                              if (b != null) lastArt = b;
+                          }
+                      }
+                      RemoteViews rv = new RemoteViews(getPackageName(), R.layout.notif_hires);
+                      rv.setTextViewText(R.id.n_title, lastTitle);
+                      rv.setTextViewText(R.id.n_artist, lastArtist);
+                      if (lastArt != null) rv.setImageViewBitmap(R.id.n_art, lastArt);
+                      else rv.setImageViewResource(R.id.n_art, R.drawable.ic_play);
+                      rv.setImageViewResource(R.id.n_play, lastPlaying ? R.drawable.ic_pause : R.drawable.ic_play);
+                      rv.setOnClickPendingIntent(R.id.n_prev, act(A_PREV, 1));
+                      rv.setOnClickPendingIntent(R.id.n_play, act(A_PLAY, 2));
+                      rv.setOnClickPendingIntent(R.id.n_next, act(A_NEXT, 3));
+
+                      Intent open = getPackageManager().getLaunchIntentForPackage(getPackageName());
+                      PendingIntent openPi = open == null ? null
+                              : PendingIntent.getActivity(this, 0, open, PendingIntent.FLAG_IMMUTABLE | PendingIntent.FLAG_UPDATE_CURRENT);
+
+                      NotificationCompat.Builder nb = new NotificationCompat.Builder(this, CHANNEL_ID)
+                              .setSmallIcon(android.R.drawable.ic_media_play)
+                              .setStyle(new NotificationCompat.DecoratedCustomViewStyle())
+                              .setCustomContentView(rv)
+                              .setCustomBigContentView(rv)
+                              .setContentTitle(lastTitle)
+                              .setContentText(lastArtist)
+                              .setOngoing(lastPlaying)
+                              .setOnlyAlertOnce(true)
+                              .setSilent(true)
+                              .setCategory(NotificationCompat.CATEGORY_TRANSPORT)
+                              .setVisibility(NotificationCompat.VISIBILITY_PUBLIC);
+                      if (openPi != null) nb.setContentIntent(openPi);
+                      Notification n = nb.build();
+                      if (Build.VERSION.SDK_INT >= 29) {
+                          startForeground(1, n, ServiceInfo.FOREGROUND_SERVICE_TYPE_MEDIA_PLAYBACK);
+                      } else {
+                          startForeground(1, n);
+                      }
+                      return START_STICKY;
+                  }
+
+                  @Override
+                  public void onTaskRemoved(Intent rootIntent) {
+                      stopSelf();
+                      super.onTaskRemoved(rootIntent);
+                  }
+
+                  @Override
+                  public IBinder onBind(Intent intent) { return null; }
+              }
+          }
+          EOF
+          cat > $R/layout/notif_hires.xml << 'EOF'
+          <?xml version="1.0" encoding="utf-8"?>
+          <LinearLayout xmlns:android="http://schemas.android.com/apk/res/android"
+              android:layout_width="match_parent"
+              android:layout_height="wrap_content"
+              android:orientation="horizontal"
+              android:gravity="center_vertical"
+              android:padding="6dp"
+              android:background="@drawable/glass_bg">
+
+              <ImageView
+                  android:id="@+id/n_art"
+                  android:layout_width="52dp"
+                  android:layout_height="52dp"
+                  android:scaleType="centerCrop" />
+
+              <LinearLayout
+                  android:layout_width="0dp"
+                  android:layout_height="wrap_content"
+                  android:layout_weight="1"
+                  android:layout_marginStart="10dp"
+                  android:layout_marginEnd="6dp"
+                  android:orientation="vertical">
+
+                  <TextView
+                      android:id="@+id/n_title"
+                      android:layout_width="match_parent"
+                      android:layout_height="wrap_content"
+                      android:singleLine="true"
+                      android:ellipsize="end"
+                      android:textColor="#FFFFFFFF"
+                      android:textSize="14sp"
+                      android:textStyle="bold" />
+
+                  <TextView
+                      android:id="@+id/n_artist"
+                      android:layout_width="match_parent"
+                      android:layout_height="wrap_content"
+                      android:singleLine="true"
+                      android:ellipsize="end"
+                      android:textColor="#B3FFFFFF"
+                      android:textSize="12sp" />
+              </LinearLayout>
+
+              <ImageButton
+                  android:id="@+id/n_prev"
+                  android:layout_width="38dp"
+                  android:layout_height="38dp"
+                  android:background="@drawable/glass_btn"
+                  android:src="@drawable/ic_prev"
+                  android:contentDescription="prev" />
+
+              <ImageButton
+                  android:id="@+id/n_play"
+                  android:layout_width="44dp"
+                  android:layout_height="44dp"
+                  android:layout_marginStart="6dp"
+                  android:layout_marginEnd="6dp"
+                  android:background="@drawable/glass_btn_main"
+                  android:src="@drawable/ic_pause"
+                  android:contentDescription="play" />
+
+              <ImageButton
+                  android:id="@+id/n_next"
+                  android:layout_width="38dp"
+                  android:layout_height="38dp"
+                  android:background="@drawable/glass_btn"
+                  android:src="@drawable/ic_next"
+                  android:contentDescription="next" />
+          </LinearLayout>
+          EOF
+          cat > $R/drawable/glass_bg.xml << 'EOF'
+          <?xml version="1.0" encoding="utf-8"?>
+          <shape xmlns:android="http://schemas.android.com/apk/res/android" android:shape="rectangle">
+              <gradient android:angle="0" android:startColor="#FF232C73" android:endColor="#FF0D0A24" />
+          </shape>
+          EOF
+          cat > $R/drawable/glass_btn.xml << 'EOF'
+          <?xml version="1.0" encoding="utf-8"?>
+          <shape xmlns:android="http://schemas.android.com/apk/res/android" android:shape="oval">
+              <gradient android:angle="270" android:startColor="#44FFFFFF" android:endColor="#14FFFFFF" />
+              <stroke android:width="1dp" android:color="#66FFFFFF" />
+          </shape>
+          EOF
+          cat > $R/drawable/glass_btn_main.xml << 'EOF'
+          <?xml version="1.0" encoding="utf-8"?>
+          <shape xmlns:android="http://schemas.android.com/apk/res/android" android:shape="oval">
+              <gradient android:angle="270" android:startColor="#886EE7B7" android:endColor="#2A6EE7B7" />
+              <stroke android:width="1.5dp" android:color="#AA6EE7B7" />
+          </shape>
+          EOF
+          cat > $R/drawable/ic_play.xml << 'EOF'
+          <?xml version="1.0" encoding="utf-8"?>
+          <vector xmlns:android="http://schemas.android.com/apk/res/android" android:width="24dp" android:height="24dp" android:viewportWidth="24" android:viewportHeight="24">
+              <path android:fillColor="#FFFFFFFF" android:pathData="M8,5v14l11,-7z" />
+          </vector>
+          EOF
+          cat > $R/drawable/ic_pause.xml << 'EOF'
+          <?xml version="1.0" encoding="utf-8"?>
+          <vector xmlns:android="http://schemas.android.com/apk/res/android" android:width="24dp" android:height="24dp" android:viewportWidth="24" android:viewportHeight="24">
+              <path android:fillColor="#FFFFFFFF" android:pathData="M6,19h4V5H6v14zM14,5v14h4V5h-4z" />
+          </vector>
+          EOF
+          cat > $R/drawable/ic_prev.xml << 'EOF'
+          <?xml version="1.0" encoding="utf-8"?>
+          <vector xmlns:android="http://schemas.android.com/apk/res/android" android:width="24dp" android:height="24dp" android:viewportWidth="24" android:viewportHeight="24">
+              <path android:fillColor="#FFFFFFFF" android:pathData="M6,6h2v12H6zM9.5,12l8.5,6V6z" />
+          </vector>
+          EOF
+          cat > $R/drawable/ic_next.xml << 'EOF'
+          <?xml version="1.0" encoding="utf-8"?>
+          <vector xmlns:android="http://schemas.android.com/apk/res/android" android:width="24dp" android:height="24dp" android:viewportWidth="24" android:viewportHeight="24">
+              <path android:fillColor="#FFFFFFFF" android:pathData="M6,18l8.5,-6L6,6v12zM16,6v12h2V6h-2z" />
+          </vector>
+          EOF
+
+      - name: Patch AndroidManifest
+        run: |
+          python3 - << 'PY'
+          p = 'android/app/src/main/AndroidManifest.xml'
+          s = open(p, encoding='utf-8').read()
+          svc = '<service android:name="kz.enakypbek.hires.HiResAudioPlugin$PlaybackService" android:exported="false" android:foregroundServiceType="mediaPlayback" />\n    '
+          rcv = '<receiver android:name="kz.enakypbek.hires.HiResAudioPlugin$NotifReceiver" android:exported="false" />\n    '
+          if 'PlaybackService' not in s:
+              s = s.replace('</application>', svc + rcv + '</application>')
+          perms = ['FOREGROUND_SERVICE', 'FOREGROUND_SERVICE_MEDIA_PLAYBACK', 'POST_NOTIFICATIONS', 'WAKE_LOCK', 'MODIFY_AUDIO_SETTINGS', 'REQUEST_IGNORE_BATTERY_OPTIMIZATIONS']
+          add = ''
+          for x in perms:
+              if 'android.permission.' + x + '"' not in s:
+                  add += '    <uses-permission android:name="android.permission.' + x + '" />\n'
+          s = s.replace('</manifest>', add + '</manifest>')
+          open(p, 'w', encoding='utf-8').write(s)
+          PY
+          grep -n "PlaybackService\|permission" android/app/src/main/AndroidManifest.xml
+
+      - name: Sync web assets
+        run: npx cap sync android
+
+      - name: Build debug APK
+        run: |
+          cd android
+          chmod +x gradlew
+          ./gradlew assembleDebug --no-daemon
+
+      - name: Upload APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: app-debug
+          path: android/app/build/outputs/apk/debug/app-debug.apk
