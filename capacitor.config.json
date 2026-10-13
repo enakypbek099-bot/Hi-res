@@ -1,0 +1,9 @@
+{
+  "appId": "kz.enakypbek.hires",
+  "appName": "Hi-Res",
+  "webDir": "www",
+  "backgroundColor": "#07060d",
+  "android": {
+    "allowMixedContent": false
+  }
+}
